@@ -1,0 +1,139 @@
+import os
+import subprocess
+import sys
+import logging
+import json
+from datetime import datetime
+import hashlib
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Ensure rkhunter is installed (you need to install it in the virtual environment)
+def check_rkhunter_installed():
+    try:
+        subprocess.run(['rkhunter', '--version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logging.info("rkhunter is installed.")
+    except subprocess.CalledProcessError:
+        logging.error("rkhunter is not installed. Please install it before running this script.")
+        sys.exit(1)
+
+# Function to execute ADB commands
+def adb_command(command):
+    result = subprocess.run(['adb'] + command, capture_output=True, text=True)
+    if result.returncode != 0:
+        logging.error(f"ADB command failed: {' '.join(command)}")
+        logging.error(f"Error: {result.stderr.strip()}")
+    return result.stdout.strip(), result.stderr.strip()
+
+# Retrieve APK files from the Android device
+def retrieve_apk_files():
+    logging.info("Retrieving APK files from the Android device...")
+    stdout, stderr = adb_command(['shell', 'pm', 'list', 'packages', '-f'])
+    
+    if stderr:
+        logging.error(f"Error retrieving APK files: {stderr}")
+        return []
+
+    apk_files = []
+    for line in stdout.splitlines():
+        apk_path = line.split('=')[0].replace('package:', '')
+        apk_files.append(apk_path)
+    
+    logging.info(f"Found {len(apk_files)} APK files.")
+    return apk_files
+
+# Pull APK files to a safe sandbox directory
+def pull_apk_files(apk_files):
+    local_apk_dir = './apks'
+    os.makedirs(local_apk_dir, exist_ok=True)
+    
+    pulled_files = []
+    
+    for apk in apk_files:
+        local_apk_path = os.path.join(local_apk_dir, os.path.basename(apk))
+        logging.info(f"Pulling {apk} to {local_apk_path}...")
+        stdout, stderr = adb_command(['pull', apk, local_apk_path])
+        
+        if stderr:
+            logging.error(f"Error pulling {apk}: {stderr}")
+        else:
+            logging.info(f"Successfully pulled {apk}.")
+            pulled_files.append(local_apk_path)
+
+    return pulled_files
+
+# Function to compute the hash of a file
+def compute_file_hash(file_path):
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+# Run rkhunter on the pulled APK files
+def run_rkhunter():
+    logging.info("Running rkhunter...")
+    result = subprocess.run(['rkhunter', '--check', '--report-warnings-only'], capture_output=True, text=True)
+
+    if result.stderr:
+        logging.error(f"Error running rkhunter: {result.stderr.strip()}")
+
+    return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+# Save findings to JSON file
+def save_findings(findings):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f'rkhunter_findings_{timestamp}.json'
+    
+    with open(filename, 'w') as json_file:
+        json.dump(findings, json_file, indent=4)
+    
+    logging.info(f"Findings saved to {filename}")
+
+def main():
+    check_rkhunter_installed()
+    apk_files = retrieve_apk_files()
+    
+    if not apk_files:
+        logging.warning("No APK files found on the device.")
+        return
+
+    pulled_files = pull_apk_files(apk_files)
+    
+    findings = {
+        "timestamp": datetime.now().isoformat(),
+        "pulled_files": [],
+        "infections": []
+    }
+
+    for file_path in pulled_files:
+        file_info = {
+            "path": file_path,
+            "hash": compute_file_hash(file_path)
+        }
+        findings["pulled_files"].append(file_info)
+
+    rkhunter_output, rkhunter_error, error_code = run_rkhunter()
+
+    if error_code != 0:
+        findings["error"] = {
+            "code": error_code,
+            "message": rkhunter_error
+        }
+
+    for line in rkhunter_output.splitlines():
+        if "Warning" in line or "Possible" in line:
+            infection_detail = {
+                "message": line.strip(),
+                "original_path": None,
+                "url": None,
+                "ip": None,
+                "hash": None
+            }
+            findings["infections"].append(infection_detail)
+
+    save_findings(findings)
+
+if __name__ == '__main__':
+    main()
